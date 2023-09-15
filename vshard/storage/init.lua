@@ -3256,15 +3256,31 @@ local function rebalancer_cfg_find_instance(cfg)
     return target_uuid
 end
 
-local function rebalancer_is_needed()
-    if M.this_replicaset.is_master_auto then
-        return false
+local function rebalancer_cfg_find_replicaset(cfg)
+    local target_uuid
+    for rs_uuid, rs in pairs(cfg.sharding) do
+        local ok = true
+        ok = ok and (rs.master == 'auto')
+        ok = ok and (not target_uuid or rs_uuid < target_uuid)
+        if ok then
+            target_uuid = rs_uuid
+        end
     end
+    return target_uuid
+end
+
+local function rebalancer_is_needed()
     local cfg = M.current_cfg
     local this_replica_uuid = M.this_replica.uuid
+    local this_replicaset_uuid = M.this_replicaset.uuid
+
     local uuid = rebalancer_cfg_find_instance(cfg)
     if uuid then
         return this_replica_uuid == uuid
+    end
+    uuid = rebalancer_cfg_find_replicaset(cfg)
+    if uuid then
+        return this_replicaset_uuid == uuid and this_is_master()
     end
     return false
 end
@@ -3452,6 +3468,7 @@ local function master_on_disable()
         M.recovery_fiber = nil
         log.info('Recovery stopped')
     end
+    rebalancer_role_update()
 end
 
 local function master_on_enable()
@@ -3462,6 +3479,7 @@ local function master_on_enable()
         util.reloadable_fiber_create('vshard.gc', M, 'gc_bucket_f')
     M.recovery_fiber =
         util.reloadable_fiber_create('vshard.recovery', M, 'recovery_f')
+    rebalancer_role_update()
 end
 
 local function master_role_synchronize()

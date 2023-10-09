@@ -166,6 +166,12 @@ if not M then
         -- checks into the other almost always used wrapper.
         api_call_cache = nil,
 
+        --------------- Instance state management ----------------
+        -- Fiber for monitoring the instance state and making changes related
+        -- to it.
+        instance_watch_fiber = nil,
+        instance_watch_service = nil,
+
         ------------------- Garbage collection -------------------
         -- Fiber to remove garbage buckets data.
         collect_bucket_garbage_fiber = nil,
@@ -3178,6 +3184,9 @@ local function rebalancer_cfg_find_instance(cfg)
 end
 
 local function rebalancer_is_needed()
+    if M.this_replicaset.is_master_auto then
+        return false
+    end
     local cfg = M.current_cfg
     local this_replica_uuid = M.this_replica.uuid
     local uuid = rebalancer_cfg_find_instance(cfg)
@@ -3381,6 +3390,101 @@ local function master_on_enable()
         util.reloadable_fiber_create('vshard.recovery', M, 'recovery_f')
 end
 
+local function master_role_synchronize()
+    if not M.this_replicaset.is_master_auto then
+        return
+    end
+    -- Box.info.ro property is selected as a good indication whether the
+    -- instance is master, because it works with the classical solution when
+    -- box.cfg.read_only is used to assign the master manually, and with the
+    -- automatic election mechanism - the elected leader might be read-only in
+    -- certain situations, but a fully functioning one will be writable
+    -- eventually.
+    local is_master = not box.info.ro
+    if is_master == this_is_master() then
+        return
+    end
+    if is_master then
+        master_on_enable()
+    else
+        master_on_disable()
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Instance state management
+--------------------------------------------------------------------------------
+
+local function instance_watch_wait_f()
+    while true do
+        local is_ro = box.info.ro
+        lfiber.testcancel()
+        if is_ro then
+            box.ctl.wait_rw()
+        else
+            box.ctl.wait_ro()
+        end
+        if is_ro ~= box.info.ro then
+            local prefix = 'Instance state has changed from '
+            if is_ro then
+                log.info(prefix .. 'read-only to writable')
+            else
+                log.info(prefix .. 'writable to read-only')
+            end
+            if M.instance_watch_fiber then
+                M.instance_watch_fiber:wakeup()
+            end
+        end
+    end
+end
+
+local function instance_watch_service_f(service)
+    local module_version = M.module_version
+    while module_version == M.module_version do
+        service:next_iter()
+        service:set_activity('master switch')
+        master_role_synchronize()
+        service:set_activity('idling')
+        service:set_status_ok()
+        lfiber.testcancel()
+        lfiber.sleep(consts.INSTANCE_WATCH_IDLE_INTERVAL)
+    end
+end
+
+local function instance_watch_f()
+    assert(not M.instance_watch_service)
+    local service = lservice_info.new('instance_watch')
+    local wait_fiber
+    M.instance_watch_service = service
+    local ok, err = pcall(function()
+        wait_fiber = lfiber.new(instance_watch_wait_f)
+        instance_watch_service_f(service)
+    end)
+    assert(M.instance_watch_service == service)
+    if wait_fiber then
+        -- Cancel throws if the current fiber is canceled. Hence pcall().
+        pcall(wait_fiber.cancel, wait_fiber)
+    end
+    M.instance_watch_service = nil
+    if not ok then
+        error(err)
+    end
+end
+
+local function instance_watch_update()
+    if M.this_replicaset.is_master_auto then
+        if not M.instance_watch_fiber then
+            M.instance_watch_fiber = util.reloadable_fiber_create(
+                'vshard.state_watch', M, 'instance_watch_f')
+        end
+        return
+    end
+    if M.instance_watch_fiber then
+        M.instance_watch_fiber:cancel()
+        M.instance_watch_fiber = nil
+    end
+end
+
 --------------------------------------------------------------------------------
 -- Configuration
 --------------------------------------------------------------------------------
@@ -3409,7 +3513,7 @@ local function storage_cfg_build_local_box_cfg(cfgctx)
             table.insert(box_cfg.replication, replica.uri)
         end
     end
-    if box_cfg.read_only == nil then
+    if box_cfg.read_only == nil and not cfgctx.is_master_auto then
         box_cfg.read_only = not cfgctx.is_master_in_cfg
     end
     if type(box.cfg) == 'function' then
@@ -3432,8 +3536,29 @@ local function storage_cfg_build_local_box_cfg(cfgctx)
 end
 
 local function storage_cfg_master_prepare(cfgctx)
-    if cfgctx.was_master_in_cfg and not cfgctx.is_master_in_cfg then
-        log.info('Preparing to disable the master role')
+    local do_disable_via_config = false
+    local do_enable_via_config = false
+    if not cfgctx.was_master_auto and not cfgctx.is_master_auto then
+        if cfgctx.was_master_in_cfg and not cfgctx.is_master_in_cfg then
+            do_disable_via_config = true
+        elseif not cfgctx.was_master_in_cfg and cfgctx.is_master_in_cfg then
+            do_enable_via_config = true
+        end
+    elseif not cfgctx.was_master_auto and cfgctx.is_master_auto then
+        log.info('Enabling master auto-detection')
+    elseif cfgctx.was_master_auto and not cfgctx.is_master_auto then
+        log.info('Disabling master auto-detection')
+        if cfgctx.is_master_in_cfg then
+            do_enable_via_config = true
+        else
+            do_disable_via_config = true
+        end
+    else
+        assert(cfgctx.was_master_auto and cfgctx.is_master_auto)
+    end
+
+    if do_disable_via_config then
+        log.info('Disabling master via config')
         if not cfgctx.old_cfg or cfgctx.old_cfg.read_only == nil then
             table.insert(cfgctx.rollback_guards, {
                 name = 'master_disable_prepare', func = function()
@@ -3444,7 +3569,7 @@ local function storage_cfg_master_prepare(cfgctx)
             box.cfg({read_only = true})
             sync(cfgctx.new_cfg.sync_timeout)
         end
-    elseif not cfgctx.was_master_in_cfg and cfgctx.is_master_in_cfg then
+    elseif do_enable_via_config then
         --
         -- Promote does not require sync, because a replica can not have data,
         -- that is not on the current master - the replica is read only. But
@@ -3452,18 +3577,33 @@ local function storage_cfg_master_prepare(cfgctx)
         -- called, it can not be guaranteed, that the promotion will be
         -- successful.
         --
-        log.info('Preparing to enable the master role')
+        log.info('Enabling master via config')
     end
 end
 
 local function storage_cfg_master_commit(cfgctx)
-    if cfgctx.was_master_in_cfg and not cfgctx.is_master_in_cfg then
-        master_on_disable()
-    elseif not cfgctx.was_master_in_cfg and cfgctx.is_master_in_cfg then
-        if cfgctx.new_cfg.read_only == nil then
-            box.cfg({read_only = false})
+    if not cfgctx.was_master_auto and not cfgctx.is_master_auto then
+        if cfgctx.was_master_in_cfg and not cfgctx.is_master_in_cfg then
+            master_on_disable()
+        elseif not cfgctx.was_master_in_cfg and cfgctx.is_master_in_cfg then
+            if cfgctx.new_cfg.read_only == nil then
+                box.cfg({read_only = false})
+            end
+            master_on_enable()
         end
-        master_on_enable()
+    elseif not cfgctx.was_master_auto and cfgctx.is_master_auto then
+        master_role_synchronize()
+    elseif cfgctx.was_master_auto and not cfgctx.is_master_auto then
+        if cfgctx.is_master_in_cfg ~= this_is_master() then
+            if cfgctx.is_master_in_cfg then
+                master_on_enable()
+            else
+                master_on_disable()
+            end
+        end
+    else
+        assert(cfgctx.was_master_auto and cfgctx.is_master_auto)
+        master_role_synchronize()
     end
 end
 
@@ -3494,11 +3634,13 @@ local function storage_cfg_context_extend(cfgctx)
         cfgctx.old_replicaset_cfg = old_rs_cfg
         cfgctx.old_instance_cfg = old_rs_cfg.replicas[instance_uuid]
         cfgctx.was_master_in_cfg = cfgctx.old_instance_cfg.master
+        cfgctx.was_master_auto = old_rs_cfg.master == 'auto'
     end
     local new_rs_cfg = new_cfg.sharding[replicaset_uuid]
     cfgctx.new_replicaset_cfg = new_rs_cfg
     cfgctx.new_instance_cfg = new_rs_cfg.replicas[instance_uuid]
     cfgctx.is_master_in_cfg = cfgctx.new_instance_cfg.master
+    cfgctx.is_master_auto = new_rs_cfg.master == 'auto'
 end
 
 local function storage_cfg_xc(cfgctx)
@@ -3547,6 +3689,7 @@ local function storage_cfg_xc(cfgctx)
     M.sync_timeout = new_cfg.sync_timeout
     M.current_cfg = new_cfg
     storage_cfg_master_commit(cfgctx)
+    instance_watch_update()
     rebalancer_role_update()
 
     local uri = luri.parse(M.this_replica.uri)
@@ -3632,7 +3775,7 @@ local function storage_info(opts)
     local alert = lerror.alert
     local this_uuid = M.this_replicaset.uuid
     local this_master = M.this_replicaset.master
-    if this_master == nil then
+    if this_master == nil and not M.this_replicaset.is_master_auto then
         table.insert(state.alerts, alert(code.MISSING_MASTER, this_uuid))
         state.status = math.max(state.status, consts.STATUS.ORANGE)
     end
@@ -3724,19 +3867,23 @@ local function storage_info(opts)
     local ireplicasets = {}
     for uuid, replicaset in pairs(M.replicasets) do
         local master = replicaset.master
-        if not master then
-            ireplicasets[uuid] = {uuid = uuid, master = 'missing'}
+        local master_info
+        if replicaset.is_master_auto then
+            master_info = 'auto'
+        elseif not master then
+            master_info = 'missing'
         else
             local uri = master:safe_uri()
             local conn = master.conn
-            ireplicasets[uuid] = {
-                uuid = uuid;
-                master = {
-                    uri = uri, uuid = conn and conn.peer_uuid,
-                    state = conn and conn.state, error = conn and conn.error,
-                };
-            };
+            master_info = {
+                uri = uri, uuid = conn and conn.peer_uuid,
+                state = conn and conn.state, error = conn and conn.error,
+            }
         end
+        ireplicasets[uuid] = {
+            uuid = uuid,
+            master = master_info,
+        }
     end
     state.replicasets = ireplicasets
     if opts and opts.with_services then
@@ -3746,6 +3893,8 @@ local function storage_info(opts)
             recovery = M.recovery_service and M.recovery_service:info(),
             routes_applier = M.routes_applier_service and
                 M.routes_applier_service:info(),
+            instance_watch = M.instance_watch_service and
+                M.instance_watch_service:info(),
         }
     end
     return state
@@ -3896,6 +4045,7 @@ end
 M.recovery_f = recovery_f
 M.rebalancer_f = rebalancer_f
 M.gc_bucket_f = gc_bucket_f
+M.instance_watch_f = instance_watch_f
 
 --
 -- These functions are saved in M not for atomic reload, but for

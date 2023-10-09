@@ -3540,6 +3540,8 @@ local function storage_cfg_xc(cfgctx)
     M.rebalancer_worker_count = new_cfg.rebalancer_max_sending
     M.sync_timeout = new_cfg.sync_timeout
     M.current_cfg = new_cfg
+    storage_cfg_master_commit(cfgctx)
+    rebalancer_role_update()
 
     local uri = luri.parse(M.this_replica.uri)
     schema_upgrade(is_first_cfg, cfgctx.is_master_in_cfg,
@@ -3553,9 +3555,6 @@ local function storage_cfg_xc(cfgctx)
     else
         schema_install_triggers_delayed()
     end
-
-    storage_cfg_master_commit(cfgctx)
-    rebalancer_role_update()
 
     M.is_configured = true
     -- Destroy connections, not used in a new configuration.

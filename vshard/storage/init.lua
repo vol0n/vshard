@@ -1103,7 +1103,10 @@ end
 --
 -- Check if a local bucket can become active.
 --
-local function recovery_local_bucket_is_active(_, remote_bucket)
+local function recovery_local_bucket_is_active(local_bucket, remote_bucket)
+    if M.rebalancer_transfering_buckets[local_bucket.id] then
+        return false
+    end
     if not remote_bucket then
         return true
     end
@@ -1208,7 +1211,7 @@ local function recovery_service_f(service)
     -- until next _bucket change.
     local bucket_generation_recovered = -1
     local bucket_generation_current = M.bucket_generation
-    local ok, sleep_time, is_all_recovered, total, recovered
+    local ok, sleep_time, is_all_recovered, total, recovered, has_error
     -- Interrupt recovery if a module has been reloaded. Perhaps,
     -- there was found a bug, and reload fixes it.
     while module_version == M.module_version do
@@ -1218,6 +1221,7 @@ local function recovery_service_f(service)
             lfiber.sleep(0.01)
             goto continue
         end
+        has_error = false
         is_all_recovered = true
         if bucket_generation_recovered == bucket_generation_current then
             goto sleep
@@ -1227,6 +1231,7 @@ local function recovery_service_f(service)
         ok, total, recovered = pcall(recovery_step_by_type,
                                      consts.BUCKET.SENDING)
         if not ok then
+            has_error = true
             is_all_recovered = false
             log.error(service:set_status_error(
                 'Error during sending buckets recovery: %s', total))
@@ -1238,6 +1243,7 @@ local function recovery_service_f(service)
         ok, total, recovered = pcall(recovery_step_by_type,
                                      consts.BUCKET.RECEIVING)
         if not ok then
+            has_error = true
             is_all_recovered = false
             log.error(service:set_status_error(
                 'Error during receiving buckets recovery: %s', total))
@@ -1251,10 +1257,12 @@ local function recovery_service_f(service)
         end
 
     ::sleep::
+        if not has_error then
+            service:set_status_ok()
+        end
         if not is_all_recovered then
             bucket_generation_recovered = -1
         else
-            service:set_status_ok()
             bucket_generation_recovered = bucket_generation_current
         end
         bucket_generation_current = M.bucket_generation

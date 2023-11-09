@@ -2930,7 +2930,9 @@ end
 -- Map-Reduce API.
 --
 local function storage_ref(rid, timeout)
+    log.verbose("storage_ref")
     local ok, err = lref.add(rid, box.session.id(), timeout)
+    log.verbose("after adding lref")
     if not ok then
         return nil, err
     end

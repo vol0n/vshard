@@ -26,6 +26,7 @@ local MODULE_INTERNALS = '__module_vshard_storage_ref'
 local MODULE_VERSION = 1
 
 local lfiber = require('fiber')
+local log = require('log')
 local lheap = require('vshard.heap')
 local lerror = require('vshard.error')
 local lconsts = require('vshard.consts')
@@ -338,28 +339,36 @@ local function ref_add(rid, sid, timeout)
     local storage = lregistry.storage
     local sched = lregistry.storage_sched
 
+    log.verbose("before ref start")
     timeout, err = sched.ref_start(timeout)
     if not timeout then
+        log.verbose("not timeout")
         return nil, err
     end
 
+    log.verbose("wait for all rw")
     while not storage.bucket_are_all_rw() do
         ok, err = storage.bucket_generation_wait(timeout)
         if not ok then
+            log.verbose("bucket gen wait")
             goto fail_sched
         end
         now = fiber_clock()
         timeout = deadline - now
     end
+    log.verbose("after wait for all rw")
     session = M.session_map[sid]
     if not session then
+        log.verbose("not session")
         session = ref_session_new(sid)
     end
     ok, err = session:add(rid, deadline, now)
+    log.verbose("after session add")
     if ok then
         return true
     end
 ::fail_sched::
+    log.verbose("fail sched")
     sched.ref_end(1)
     return nil, err
 end
